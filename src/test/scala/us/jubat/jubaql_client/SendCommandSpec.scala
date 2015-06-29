@@ -74,8 +74,7 @@ class SendCommandSpec extends FlatSpec with Matchers with MockServer {
     val mockPrintStream = new PrintStream(mockStdout)
     JubaQLClient.handleCommand("localhost", 9877, "1234", "",
       mockPrintStream)
-    mockStdout.toString should startWith(
-      "[ERROR] null: Unexpected response status: 400")
+    mockStdout.toString should startWith("[ERROR/400]")
   }
 
   "Sending a command with a valid session to a non-existing server" should
@@ -103,8 +102,7 @@ class SendCommandSpec extends FlatSpec with Matchers with MockServer {
     val mockPrintStream = new PrintStream(mockStdout)
     JubaQLClient.handleCommand("localhost", 9877, "123", "TRAIN jubatus",
       mockPrintStream)
-    mockStdout.toString should startWith(
-      "[ERROR] null: Unexpected response status: 401")
+    mockStdout.toString should startWith("[ERROR/401]")
   }
 
   "Receiving invalid JSON" should "print an error" in {

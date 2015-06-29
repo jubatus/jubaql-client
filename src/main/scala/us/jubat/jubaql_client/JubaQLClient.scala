@@ -15,6 +15,7 @@
 // Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
 package us.jubat.jubaql_client
 
+import com.ning.http.client.Response
 import dispatch._
 import dispatch.Defaults._
 import scopt.OptionParser
@@ -24,7 +25,7 @@ import java.io.{PrintStream, PrintWriter}
 import jline.console.ConsoleReader
 import java.nio.file.{Paths, Files}
 import scala.io.Source
-import org.json4s.JsonAST.JString
+import org.json4s.JsonAST.{JNothing, JString}
 
 object JubaQLClient {
   /** Main function to start the JubaQL client shell.
@@ -82,6 +83,7 @@ object JubaQLClient {
         // ask for commands and forward them to server
         Console.err.println("Please enter your JubaQL commands. Type Ctrl+D or \"exit\" to quit.")
         val reader = new ConsoleReader()
+        reader.setExpandEvents(false)
         val output = new PrintWriter(reader.getOutput)
         reader.setPrompt("jubaql> ")
         var line = reader.readLine()
@@ -141,24 +143,33 @@ object JubaQLClient {
     val url = :/(hostname, port) / "jubaql"
     val payloadData = ("session_id" -> sessionId) ~ ("query" -> cmd)
     val json: String = compact(render(payloadData))
-    val req = Http(url << json OK as.String)
-    req.either.apply() match {
-      case Left(error) =>
-        // if request fails or is non-2xx, print error
-        out.println("[ERROR] " + error.getCause + ": " + error.getMessage)
-        out.flush()
-        true
-      case Right(resultJson) =>
+    // create response handler
+    val printResponse: Response => Boolean = {
+      resp => {
+        val resultJson = resp.getResponseBody
         // if we can parse JSON, print it nicely formatted;
         // otherwise print an error
         parseOpt(resultJson) match {
           case Some(result) =>
+            if (resp.getStatusCode / 100 != 2) {
+              out.print("[ERROR/%s] ".format(resp.getStatusCode))
+            }
             result \ "result" match {
+              case JString(status) if status == "STATUS" =>
+                out.println(status)
+                // print all but the "result" field
+                val withoutResult = result.removeField(_._1 == "result")
+                out.println(pretty(render(withoutResult)))
+                true
               case JString(status) =>
                 out.println(status)
                 out.flush()
                 // return false if server shut down successfully
                 !status.startsWith("SHUTDOWN")
+              case JNothing =>
+                out.println("response did not contain a result")
+                out.flush()
+                true
               case other =>
                 out.println(pretty(render(result \ "result")))
                 out.flush()
@@ -169,6 +180,18 @@ object JubaQLClient {
             out.flush()
             true
         }
+      }
+    }
+    val req = Http(url << json > printResponse)
+    req.either.apply() match {
+      case Left(error) =>
+        // if request failed, print error
+        out.println("[ERROR] " + error.getCause + ": " + error.getMessage)
+        out.flush()
+        true
+      case Right(continue_?) =>
+        // if request succeeded, return the result of printResponse
+        continue_?
     }
   }
 

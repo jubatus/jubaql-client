@@ -57,17 +57,14 @@ object JubaQLClient {
       }
     })
 
-    // login if session id is not given
-    val sessionId = sessionIdParameter match {
-      case Some(session) =>
-        session
-      case _ =>
-        val serverResponse = getSessionId(hostname, port)
-        if (serverResponse.isEmpty) {
-          System.exit(1)
-        }
-        serverResponse.get
+    val serverResponse = sessionIdParameter match {
+      case Some(session) => getSessionId(hostname, port, session)
+      case _ => getSessionId(hostname, port)
     }
+    if (serverResponse.isEmpty) {
+      System.exit(1)
+    }
+    val sessionId = serverResponse.get
     Console.err.println("Using session id \"%s\"".format(sessionId))
 
     // read from stdin or the given scriptfile
@@ -104,14 +101,22 @@ object JubaQLClient {
     System.exit(0)
   }
 
-  /** Gets a session id from a JubaQL gateway server.
-    *
-    * @return some session id if login was successful
-    */
+  /**
+   * Gets a session id from a JubaQL gateway server.
+   *
+   * @return some session id if login was successful
+   */
   def getSessionId(hostname: String, port: Int,
-                   err: PrintStream = Console.err): Option[String] = {
+                   sessionId: String = null, err: PrintStream = Console.err): Option[String] = {
     val url = :/(hostname, port) / "login"
-    val req = Http(url.POST OK as.String)
+    val req = sessionId match {
+      case null => Http(url.POST OK as.String)
+      case _ => {
+        val payloadData = ("session_id" -> sessionId)
+        val json: String = compact(render(payloadData))
+        Http(url << json OK as.String)
+      }
+    }
     req.either.apply() match {
       case Left(error) =>
         // if request fails or is non-2xx, print error

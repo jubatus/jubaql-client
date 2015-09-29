@@ -110,32 +110,38 @@ object JubaQLClient {
                    sessionId: String = null, err: PrintStream = Console.err): Option[String] = {
     val url = :/(hostname, port) / "login"
     val req = sessionId match {
-      case null => Http(url.POST OK as.String)
+      case null => Http(url.POST)
       case _ => {
         val payloadData = ("session_id" -> sessionId)
         val json: String = compact(render(payloadData))
-        Http(url << json OK as.String)
+        Http(url << json)
       }
     }
     req.either.apply() match {
+      case Right(resp) =>
+        if (resp.getStatusCode / 100 != 2) {
+          println("[ERROR/%s] %s".format(resp.getStatusCode, resp.getResponseBody))
+          None
+        } else {
+          val resultJson = resp.getResponseBody
+          parseOpt(resultJson) match {
+            case Some(result) =>
+              (result \ "session_id") match {
+                case JString(session_id) =>
+                  Some(session_id)
+                case _ =>
+                  err.println("[ERROR] JSON did not contain session_id")
+                  None
+              }
+            case None =>
+              err.println("[ERROR] failed to parse JSON: \"%s\"".format(resultJson))
+              None
+          }
+        }
       case Left(error) =>
-        // if request fails or is non-2xx, print error
+        // request fails with network error
         err.println("[ERROR] " + error.getCause + ": " + error.getMessage)
         None
-      case Right(resultJson) =>
-        parseOpt(resultJson) match {
-          case Some(result) =>
-            (result \ "session_id") match {
-              case JString(session_id) =>
-                Some(session_id)
-              case _ =>
-                err.println("[ERROR] JSON did not contain session_id")
-                None
-            }
-          case None =>
-            err.println("[ERROR] failed to parse JSON: \"%s\"".format(resultJson))
-            None
-        }
     }
   }
 
@@ -157,7 +163,7 @@ object JubaQLClient {
         parseOpt(resultJson) match {
           case Some(result) =>
             if (resp.getStatusCode / 100 != 2) {
-              out.print("[ERROR/%s] ".format(resp.getStatusCode))
+              out.print("[ERROR/%s] %s".format(resp.getStatusCode, resp.getResponseBody))
             }
             result \ "result" match {
               case JString(status) if status == "STATUS" =>
@@ -191,7 +197,7 @@ object JubaQLClient {
     req.either.apply() match {
       case Left(error) =>
         // if request failed, print error
-        out.println("[ERROR] " + error.getCause + ": " + error.getMessage)
+        out.println("[ERROR] cause = " + error.getCause + ": message = " + error.getMessage)
         out.flush()
         true
       case Right(continue_?) =>

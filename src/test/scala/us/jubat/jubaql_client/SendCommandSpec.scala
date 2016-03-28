@@ -47,6 +47,10 @@ class SendCommandSpec extends FlatSpec with Matchers with MockServer {
               } else if (sessionId == "-1") {
                 // simulate non-JSON answer
                 Created ~> ResponseString("error")
+              } else if (sessionId == "TimeoutTest") {
+                Thread.sleep(1000)
+                val result = ("result" -> "OK")
+                Created ~> ResponseString(compact(render(result)))
               } else {
                 // simulate bad session
                 val result = ("error" -> "bad session id")
@@ -63,7 +67,7 @@ class SendCommandSpec extends FlatSpec with Matchers with MockServer {
   "Sending a command with a valid session" should "print the result" in {
     val mockStdout = new ByteArrayOutputStream()
     val mockPrintStream = new PrintStream(mockStdout)
-    JubaQLClient.handleCommand("localhost", 9877, "1234", "TRAIN jubatus",
+    JubaQLClient.handleCommand("localhost", 9877, -1, "1234", "TRAIN jubatus",
       mockPrintStream)
     val expected = "OK\n"
     mockStdout.toString should be(expected)
@@ -72,7 +76,7 @@ class SendCommandSpec extends FlatSpec with Matchers with MockServer {
   "Sending a bad command with a valid session" should "print an error" in {
     val mockStdout = new ByteArrayOutputStream()
     val mockPrintStream = new PrintStream(mockStdout)
-    JubaQLClient.handleCommand("localhost", 9877, "1234", "",
+    JubaQLClient.handleCommand("localhost", 9877, -1, "1234", "",
       mockPrintStream)
     mockStdout.toString should startWith("[ERROR/400]")
   }
@@ -81,7 +85,7 @@ class SendCommandSpec extends FlatSpec with Matchers with MockServer {
     "print an error" in {
     val mockStdout = new ByteArrayOutputStream()
     val mockPrintStream = new PrintStream(mockStdout)
-    JubaQLClient.handleCommand("ww.localhost", 9877, "1234", "TRAIN jubatus",
+    JubaQLClient.handleCommand("ww.localhost", 9877, -1, "1234", "TRAIN jubatus",
       mockPrintStream)
     mockStdout.toString should startWith(
       "[ERROR] java.nio.channels.UnresolvedAddressException")
@@ -91,16 +95,16 @@ class SendCommandSpec extends FlatSpec with Matchers with MockServer {
     "print an error" in {
     val mockStdout = new ByteArrayOutputStream()
     val mockPrintStream = new PrintStream(mockStdout)
-    JubaQLClient.handleCommand("localhost", 1, "1234", "TRAIN jubatus",
+    JubaQLClient.handleCommand("localhost", 1, -1, "1234", "TRAIN jubatus",
       mockPrintStream)
     mockStdout.toString should startWith(
-      "[ERROR] java.net.ConnectException: Connection refused")
+      "[ERROR] java.net.ConnectException")
   }
 
   "Sending a command with an invalid session" should "print an error" in {
     val mockStdout = new ByteArrayOutputStream()
     val mockPrintStream = new PrintStream(mockStdout)
-    JubaQLClient.handleCommand("localhost", 9877, "123", "TRAIN jubatus",
+    JubaQLClient.handleCommand("localhost", 9877, -1, "123", "TRAIN jubatus",
       mockPrintStream)
     mockStdout.toString should startWith("[ERROR/401]")
   }
@@ -109,10 +113,26 @@ class SendCommandSpec extends FlatSpec with Matchers with MockServer {
     val mockStdout = new ByteArrayOutputStream()
     val mockPrintStream = new PrintStream(mockStdout)
     // hack to get the mock server to send non-JSON
-    JubaQLClient.handleCommand("localhost", 9877, "-1", "TRAIN jubatus",
+    JubaQLClient.handleCommand("localhost", 9877, -1, "-1", "TRAIN jubatus",
       mockPrintStream)
     mockStdout.toString should startWith(
       "[ERROR] failed to parse JSON")
+  }
+
+  "Sending a command" should "success no timeout" in {
+    val mockStdout = new ByteArrayOutputStream()
+    val mockPrintStream = new PrintStream(mockStdout)
+    JubaQLClient.handleCommand("localhost", 9877, 2000, "TimeoutTest", "TRAIN jubatus",
+      mockPrintStream)
+    mockStdout.toString shouldBe "OK\n"
+  }
+
+  it should "error timeout" in {
+    val mockStdout = new ByteArrayOutputStream()
+    val mockPrintStream = new PrintStream(mockStdout)
+    JubaQLClient.handleCommand("localhost", 9877, 100, "TimeoutTest", "TRAIN jubatus",
+      mockPrintStream)
+    mockStdout.toString should startWith("[ERROR] java.util.concurrent.TimeoutException")
   }
 }
 

@@ -25,18 +25,21 @@ import java.io.{PrintStream, PrintWriter}
 import jline.console.ConsoleReader
 import java.nio.file.{Paths, Files}
 import scala.io.Source
-import org.json4s.JsonAST.{JNothing, JString}
+import org.json4s.JsonAST.{JNothing, JString, JBool, JObject}
+import us.jubat.jubaql_client.lexical._
+import scala.util.{Try, Success, Failure}
 
 object JubaQLClient {
   /** Main function to start the JubaQL client shell.
     *
     * Intended usage:
-    * `jubaql [-h hostname] [-p portname] [-f scriptfile] [session_id]`
+    * `jubaql [-h hostname] [-p port] [-f scriptfile [-e] [-c]] [-t timeout] [-s session_id [-r]]`
     *
     * The parameters have the following meanings:
     * - `hostname`, `port`: location of the JubaQL gateway
     * - `scriptfile`: if given, execute this file's contents and exit
-    * - `session_id`: if given, use this session_id and skip login
+    * - `timeout`: request timeout value
+    * - `session_id`: if given, to connect to the JubaQL gateway using this session_id
     *   (otherwise, login will be done on program start)
     */
   def main(args: Array[String]) {
@@ -48,6 +51,11 @@ object JubaQLClient {
     val port: Int = parsedOptions.port
     val scriptfile: Option[String] = parsedOptions.scriptfile
     val sessionIdParameter: Option[String] = parsedOptions.sessionIdParameter
+    val timeout = parsedOptions.timeout.fold(CommandlineOptions.defaultTimeout * 1000) { value =>
+      if (value == 0) { -1 } else { value * 1000}
+    }
+    Console.out.println(s"requestTimeout value is ${timeout} ms")
+    val isReconnect: Boolean = parsedOptions.reconnect
 
     // check if scriptfile exists
     scriptfile.foreach(filename => {
@@ -57,27 +65,33 @@ object JubaQLClient {
       }
     })
 
-    // login if session id is not given
-    val sessionId = sessionIdParameter match {
-      case Some(session) =>
-        session
-      case _ =>
-        val serverResponse = getSessionId(hostname, port)
-        if (serverResponse.isEmpty) {
-          System.exit(1)
-        }
-        serverResponse.get
+    val serverResponse = getSessionId(hostname, port, timeout, sessionIdParameter, isReconnect)
+
+    if (serverResponse.isEmpty) {
+      System.exit(1)
     }
+    val sessionId = serverResponse.get
     Console.err.println("Using session id \"%s\"".format(sessionId))
 
     // read from stdin or the given scriptfile
     scriptfile match {
       case Some(filename) =>
         // read lines from file and forward them to server
-        for(line <- Source.fromFile(filename).getLines()) {
-          if (!line.trim.isEmpty) {
-            handleCommand(hostname, port, sessionId, line)
-          }
+        loadQueriesFromFile(filename) match {
+          case Success(queryList) =>
+            queryList.foreach { query =>
+              if (confirmQuery(query, parsedOptions.confirmation)) {
+                handleCommand(hostname, port, timeout, sessionId, query) match {
+                  case ResultType.Error if (parsedOptions.exitOnFailure) =>
+                    System.exit(2)
+
+                  case _ =>
+                }
+              }
+            }
+          case Failure(e) =>
+            Console.err.println(e.getMessage())
+            System.exit(2)
         }
       case None =>
         // ask for commands and forward them to server
@@ -88,7 +102,7 @@ object JubaQLClient {
         reader.setPrompt("jubaql> ")
         var line = reader.readLine()
         while (line != null && line != "exit") {
-          if (line.trim.size > 0 && handleCommand(hostname, port, sessionId, line, output) == false) {
+          if (line.trim.size > 0 && handleCommand(hostname, port, timeout, sessionId, line, output) == ResultType.Exit) {
             line = null
           } else {
             line = reader.readLine()
@@ -104,55 +118,85 @@ object JubaQLClient {
     System.exit(0)
   }
 
-  /** Gets a session id from a JubaQL gateway server.
-    *
-    * @return some session id if login was successful
-    */
-  def getSessionId(hostname: String, port: Int,
-                   err: PrintStream = Console.err): Option[String] = {
+  /**
+   * Gets a session id from a JubaQL gateway server.
+   *
+   * @return some session id if login was successful
+   */
+  def getSessionId(hostname: String, port: Int, timeout: Int,
+                   sessionId: Option[String], isReconnect: Boolean, err: PrintStream = Console.err): Option[String] = {
     val url = :/(hostname, port) / "login"
-    val req = Http(url.POST OK as.String)
+    val myHttp = Http.configure(_.setRequestTimeoutInMs(timeout).setIdleConnectionTimeoutInMs(timeout))
+    val payloadData = (sessionId, isReconnect) match {
+      case (Some(id), true) =>
+        //connect session
+        ("new" -> false) ~ ("session_id" -> id)
+      case (Some(id), false) =>
+        // To create session, using the session id.
+        ("new" -> true) ~ ("session_id" -> id)
+      case (None, false) =>
+        // To create session, session id to be generated in JubaQL Gateway.
+        JObject("new" -> JBool(true))
+      case _ =>
+        err.println(s"[ERROR] Internal Error. illegal argument: sessionId = ${sessionId}, reconnect flag = ${isReconnect}")
+        return None
+    }
+
+    val req = myHttp(url << compact(render(payloadData)))
+
     req.either.apply() match {
-      case Left(error) =>
-        // if request fails or is non-2xx, print error
-        err.println("[ERROR] " + error.getCause + ": " + error.getMessage)
-        None
-      case Right(resultJson) =>
-        parseOpt(resultJson) match {
-          case Some(result) =>
-            (result \ "session_id") match {
-              case JString(session_id) =>
-                Some(session_id)
-              case _ =>
-                err.println("[ERROR] JSON did not contain session_id")
-                None
-            }
-          case None =>
-            err.println("[ERROR] failed to parse JSON: \"%s\"".format(resultJson))
-            None
+      case Right(resp) =>
+        if (resp.getStatusCode / 100 != 2) {
+          err.println("[ERROR/%s] %s".format(resp.getStatusCode, resp.getResponseBody))
+          None
+        } else {
+          val resultJson = resp.getResponseBody
+          parseOpt(resultJson) match {
+            case Some(result) =>
+              (result \ "session_id") match {
+                case JString(session_id) =>
+                  Some(session_id)
+                case _ =>
+                  err.println("[ERROR] JSON did not contain session_id")
+                  None
+              }
+            case None =>
+              err.println("[ERROR] failed to parse JSON: \"%s\"".format(resultJson))
+              None
+          }
         }
+      case Left(error) =>
+        // request fails with network error
+        if (error.getCause() != null) {
+          err.println(s"[ERROR] ${error.getCause()}: ${error.getMessage()}")
+        } else {
+          err.println(s"[ERROR] ${error.toString()}")
+        }
+        None
     }
   }
 
   /** Sends a JubaQL command to the server and outputs the result.
     * @return false if program should exit, true otherwise
     */
-  def handleCommand(hostname: String, port: Int,
+  def handleCommand(hostname: String, port: Int, timeout: Int,
                     sessionId: String, cmd: String,
-                    out: PrintWriter): Boolean = {
+                    out: PrintWriter): ResultType = {
     val url = :/(hostname, port) / "jubaql"
     val payloadData = ("session_id" -> sessionId) ~ ("query" -> cmd)
     val json: String = compact(render(payloadData))
     // create response handler
-    val printResponse: Response => Boolean = {
+    val printResponse: Response => ResultType = {
       resp => {
         val resultJson = resp.getResponseBody
         // if we can parse JSON, print it nicely formatted;
         // otherwise print an error
         parseOpt(resultJson) match {
           case Some(result) =>
+            var resultType: Option[ResultType] = None
             if (resp.getStatusCode / 100 != 2) {
-              out.print("[ERROR/%s] ".format(resp.getStatusCode))
+              out.print("[ERROR/%s] %s".format(resp.getStatusCode, resp.getResponseBody))
+              resultType = Some(ResultType.Error)
             }
             result \ "result" match {
               case JString(status) if status == "STATUS" =>
@@ -160,35 +204,44 @@ object JubaQLClient {
                 // print all but the "result" field
                 val withoutResult = result.removeField(_._1 == "result")
                 out.println(pretty(render(withoutResult)))
-                true
+                out.flush()
+                if (resultType.isEmpty) resultType = Some(ResultType.Success)
               case JString(status) =>
                 out.println(status)
                 out.flush()
                 // return false if server shut down successfully
-                !status.startsWith("SHUTDOWN")
+                if (status.startsWith("SHUTDOWN")) resultType = Some(ResultType.Exit)
+                else if (resultType.isEmpty) resultType = Some(ResultType.Success)
               case JNothing =>
                 out.println("response did not contain a result")
                 out.flush()
-                true
+                resultType = Some(ResultType.Error)
               case other =>
                 out.println(pretty(render(result \ "result")))
                 out.flush()
-                true
+                if (resultType.isEmpty) resultType = Some(ResultType.Success)
             }
+            resultType.get
           case None =>
             out.println("[ERROR] failed to parse JSON: \"%s\"".format(resultJson))
             out.flush()
-            true
+            ResultType.Error
         }
       }
     }
-    val req = Http(url << json > printResponse)
+
+    val myHttp = Http.configure(_.setRequestTimeoutInMs(timeout).setIdleConnectionTimeoutInMs(timeout))
+    val req = myHttp(url << json > printResponse)
     req.either.apply() match {
       case Left(error) =>
         // if request failed, print error
-        out.println("[ERROR] " + error.getCause + ": " + error.getMessage)
+        if (error.getCause() != null) {
+          out.println(s"[ERROR] ${error.getCause()}: ${error.getMessage()}")
+        } else {
+          out.println(s"[ERROR] ${error.toString()}")
+        }
         out.flush()
-        true
+        ResultType.Error
       case Right(continue_?) =>
         // if request succeeded, return the result of printResponse
         continue_?
@@ -197,10 +250,10 @@ object JubaQLClient {
 
   /** Sends a JubaQL command to the server and outputs the result.
     */
-  def handleCommand(hostname: String, port: Int,
+  def handleCommand(hostname: String, port: Int, timeout: Int,
                     sessionId: String, cmd: String,
-                    out: PrintStream = Console.out): Unit = {
-    handleCommand(hostname, port, sessionId, cmd, new PrintWriter(out))
+                    out: PrintStream = Console.out): ResultType = {
+    handleCommand(hostname, port, timeout, sessionId, cmd, new PrintWriter(out))
   }
 
   /** Returns parsed commandline option.
@@ -231,23 +284,119 @@ object JubaQLClient {
         if (!x.isEmpty) success else failure("bad scriptfile name")
       } text("execute <scriptfile> contents (optional)")
 
-      arg[String]("<session_id>") optional() action { (x, o) =>
+      opt[Int]('t', "timeout") optional() valueName("<timeout>") action { (x, o) =>
+        o.copy(timeout = Some(x))
+      } validate { x =>
+        if (x >= 0 && x <= 2145600) success else failure("bad timeout value; timeout value n must be \"0 <= n <= 2145600\"")
+      } text(s"request timeout value (default: ${CommandlineOptions.defaultTimeout}sec)")
+
+      opt[String]('s', "session") optional() valueName("<session_id>") action { (x, o) =>
         o.copy(sessionIdParameter = Some(x))
       } validate { x =>
         if (!x.isEmpty) success else failure("bad session_id")
-      } text("use <session_id> and skip login (optional)")
+      } text("connect to the JubaQL gateway using <session_id> (optional)")
+
+      opt[Unit]('r', "reconnect") optional() valueName("<session_id>") action { (x, o) =>
+        o.copy(reconnect = true)
+      } text("reconnect flag (optional)")
+
+      opt[Unit]('e', "exit-on-failure") optional() action { (x, o) =>
+        o.copy(exitOnFailure = true)
+      } text("exit-on-failure flag (optional)")
+
+      opt[Unit]('c', "confirmation") optional() action { (x, o) =>
+        o.copy(confirmation = true)
+      } text("confirmation flag (optional)")
+    }
+    parser.checkConfig { x =>
+      if (x.sessionIdParameter.isEmpty && x.reconnect) {
+        Left("-r option requires the -s option")
+      } else if (x.scriptfile.isEmpty && x.exitOnFailure) {
+        Left("-e option requires the -f option")
+      } else if (x.scriptfile.isEmpty && x.confirmation) {
+        Left("-c option requires the -f option")
+      } else {
+        Right()
+      }
     }
 
     parser.parse(args, CommandlineOptions())
+  }
+
+  private def loadQueriesFromFile(filename: String): Try[List[String]] = {
+    splitQueries(Source.fromFile(filename).mkString)
+  }
+
+  private[jubaql_client] def splitQueries(fileContents: String): Try[List[String]] = Try {
+    val lexical = new JubaQLLexical(Seq())
+    var scanner = new lexical.Scanner(fileContents)
+    var tokenList = List[String]()
+    var queryList = List[String]()
+    while (!scanner.atEnd) {
+      if (scanner.first.isInstanceOf[lexical.ErrorToken]) {
+        throw new Exception(s"[ERROR] QueryFile is format error: ${scanner.first.chars}")
+      }
+      if (scanner.first.chars == ";") {
+        queryList = queryList :+ tokenList.mkString(" ")
+        tokenList = List.empty
+      } else {
+        tokenList = tokenList :+ scanner.first.chars
+      }
+      scanner = scanner.rest
+    }
+
+    if (tokenList.nonEmpty) {
+      queryList = queryList :+ tokenList.mkString(" ")
+    }
+    queryList
+  }
+
+  private[jubaql_client] def confirmQuery(query: String, isConfirm: Boolean): Boolean = {
+    if (isConfirm) {
+      confirmQuery(query)
+    } else {
+      true
+    }
+  }
+
+  private[jubaql_client] def confirmQuery(query: String): Boolean = {
+    Console.out.println("***(Single step mode: verify command)*******************************************")
+    Console.out.println(query)
+
+    var result = false
+    var retry = true
+    while (retry) {
+      val input = readLine("***(press return to proceed or enter x and return to cancel)******************** ")
+      retry = false
+      if (input.isEmpty) result = true  // proceed
+      else if (input == "x") result = false  // cancelled
+      else retry = true
+    }
+    result
   }
 }
 
 case class CommandlineOptions(hostname: String = CommandlineOptions.defaultHostname,
                               port: Int = CommandlineOptions.defaultPort,
                               scriptfile: Option[String] = None,
-                              sessionIdParameter: Option[String] = None)
+                              timeout: Option[Int] = None,
+                              sessionIdParameter: Option[String] = None,
+                              reconnect: Boolean = false,
+                              exitOnFailure: Boolean = false,
+                              confirmation: Boolean = false)
 
 object CommandlineOptions {
   val defaultHostname = "localhost"
   val defaultPort = 9877
+  val defaultTimeout = 300
+}
+
+sealed abstract class ResultType(aName: String) {
+  val name = aName
+}
+
+object ResultType {
+  case object Success extends ResultType("Success")
+  case object Error extends ResultType("Error")
+  case object Exit extends ResultType("Exit")
 }
